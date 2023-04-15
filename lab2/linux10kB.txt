@@ -1,0 +1,399 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Cryptographic API for algorithms (i.e., low-level API).
+ *
+ * Copyright (c) 2006 Herbert Xu <herbert@gondor.apana.org.au>
+ */
+
+#include <crypto/algapi.h>
+#include <crypto/internal/simd.h>
+#include <linux/err.h>
+#include <linux/errno.h>
+#include <linux/fips.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/list.h>
+#include <linux/module.h>
+#include <linux/rtnetlink.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "internal.h"
+
+static LIST_HEAD(crypto_template_list);
+
+#ifdef CONFIG_CRYPTO_MANAGER_EXTRA_TESTS
+DEFINE_PER_CPU(bool, crypto_simd_disabled_for_test);
+EXPORT_PER_CPU_SYMBOL_GPL(crypto_simd_disabled_for_test);
+#endif
+
+static inline void crypto_check_module_sig(struct module *mod)
+{
+	if (fips_enabled && mod && !module_sig_ok(mod))
+		panic("Module %s signature verification failed in FIPS mode\n",
+		      module_name(mod));
+}
+
+static int crypto_check_alg(struct crypto_alg *alg)
+{
+	crypto_check_module_sig(alg->cra_module);
+
+	if (!alg->cra_name[0] || !alg->cra_driver_name[0])
+		return -EINVAL;
+
+	if (alg->cra_alignmask & (alg->cra_alignmask + 1))
+		return -EINVAL;
+
+	/* General maximums for all algs. */
+	if (alg->cra_alignmask > MAX_ALGAPI_ALIGNMASK)
+		return -EINVAL;
+
+	if (alg->cra_blocksize > MAX_ALGAPI_BLOCKSIZE)
+		return -EINVAL;
+
+	/* Lower maximums for specific alg types. */
+	if (!alg->cra_type && (alg->cra_flags & CRYPTO_ALG_TYPE_MASK) ==
+			       CRYPTO_ALG_TYPE_CIPHER) {
+		if (alg->cra_alignmask > MAX_CIPHER_ALIGNMASK)
+			return -EINVAL;
+
+		if (alg->cra_blocksize > MAX_CIPHER_BLOCKSIZE)
+			return -EINVAL;
+	}
+
+	if (alg->cra_priority < 0)
+		return -EINVAL;
+
+	refcount_set(&alg->cra_refcnt, 1);
+
+	return 0;
+}
+
+static void crypto_free_instance(struct crypto_instance *inst)
+{
+	inst->alg.cra_type->free(inst);
+}
+
+static void crypto_destroy_instance(struct crypto_alg *alg)
+{
+	struct crypto_instance *inst = (void *)alg;
+	struct crypto_template *tmpl = inst->tmpl;
+
+	crypto_free_instance(inst);
+	crypto_tmpl_put(tmpl);
+}
+
+/*
+ * This function adds a spawn to the list secondary_spawns which
+ * will be used at the end of crypto_remove_spawns to unregister
+ * instances, unless the spawn happens to be one that is depended
+ * on by the new algorithm (nalg in crypto_remove_spawns).
+ *
+ * This function is also responsible for resurrecting any algorithms
+ * in the dependency chain of nalg by unsetting n->dead.
+ */
+static struct list_head *crypto_more_spawns(struct crypto_alg *alg,
+					    struct list_head *stack,
+					    struct list_head *top,
+					    struct list_head *secondary_spawns)
+{
+	struct crypto_spawn *spawn, *n;
+
+	spawn = list_first_entry_or_null(stack, struct crypto_spawn, list);
+	if (!spawn)
+		return NULL;
+
+	n = list_prev_entry(spawn, list);
+	list_move(&spawn->list, secondary_spawns);
+
+	if (list_is_last(&n->list, stack))
+		return top;
+
+	n = list_next_entry(n, list);
+	if (!spawn->dead)
+		n->dead = false;
+
+	return &n->inst->alg.cra_users;
+}
+
+static void crypto_remove_instance(struct crypto_instance *inst,
+				   struct list_head *list)
+{
+	struct crypto_template *tmpl = inst->tmpl;
+
+	if (crypto_is_dead(&inst->alg))
+		return;
+
+	inst->alg.cra_flags |= CRYPTO_ALG_DEAD;
+
+	if (!tmpl || !crypto_tmpl_get(tmpl))
+		return;
+
+	list_move(&inst->alg.cra_list, list);
+	hlist_del(&inst->list);
+	inst->alg.cra_destroy = crypto_destroy_instance;
+
+	BUG_ON(!list_empty(&inst->alg.cra_users));
+}
+
+/*
+ * Given an algorithm alg, remove all algorithms that depend on it
+ * through spawns.  If nalg is not null, then exempt any algorithms
+ * that is depended on by nalg.  This is useful when nalg itself
+ * depends on alg.
+ */
+void crypto_remove_spawns(struct crypto_alg *alg, struct list_head *list,
+			  struct crypto_alg *nalg)
+{
+	u32 new_type = (nalg ?: alg)->cra_flags;
+	struct crypto_spawn *spawn, *n;
+	LIST_HEAD(secondary_spawns);
+	struct list_head *spawns;
+	LIST_HEAD(stack);
+	LIST_HEAD(top);
+
+	spawns = &alg->cra_users;
+	list_for_each_entry_safe(spawn, n, spawns, list) {
+		if ((spawn->alg->cra_flags ^ new_type) & spawn->mask)
+			continue;
+
+		list_move(&spawn->list, &top);
+	}
+
+	/*
+	 * Perform a depth-first walk starting from alg through
+	 * the cra_users tree.  The list stack records the path
+	 * from alg to the current spawn.
+	 */
+	spawns = &top;
+	do {
+		while (!list_empty(spawns)) {
+			struct crypto_instance *inst;
+
+			spawn = list_first_entry(spawns, struct crypto_spawn,
+						 list);
+			inst = spawn->inst;
+
+			list_move(&spawn->list, &stack);
+			spawn->dead = !spawn->registered || &inst->alg != nalg;
+
+			if (!spawn->registered)
+				break;
+
+			BUG_ON(&inst->alg == alg);
+
+			if (&inst->alg == nalg)
+				break;
+
+			spawns = &inst->alg.cra_users;
+
+			/*
+			 * Even if spawn->registered is true, the
+			 * instance itself may still be unregistered.
+			 * This is because it may have failed during
+			 * registration.  Therefore we still need to
+			 * make the following test.
+			 *
+			 * We may encounter an unregistered instance here, since
+			 * an instance's spawns are set up prior to the instance
+			 * being registered.  An unregistered instance will have
+			 * NULL ->cra_users.next, since ->cra_users isn't
+			 * properly initialized until registration.  But an
+			 * unregistered instance cannot have any users, so treat
+			 * it the same as ->cra_users being empty.
+			 */
+			if (spawns->next == NULL)
+				break;
+		}
+	} while ((spawns = crypto_more_spawns(alg, &stack, &top,
+					      &secondary_spawns)));
+
+	/*
+	 * Remove all instances that are marked as dead.  Also
+	 * complete the resurrection of the others by moving them
+	 * back to the cra_users list.
+	 */
+	list_for_each_entry_safe(spawn, n, &secondary_spawns, list) {
+		if (!spawn->dead)
+			list_move(&spawn->list, &spawn->alg->cra_users);
+		else if (spawn->registered)
+			crypto_remove_instance(spawn->inst, list);
+	}
+}
+EXPORT_SYMBOL_GPL(crypto_remove_spawns);
+
+static void crypto_alg_finish_registration(struct crypto_alg *alg,
+					   bool fulfill_requests,
+					   struct list_head *algs_to_put)
+{
+	struct crypto_alg *q;
+
+	list_for_each_entry(q, &crypto_alg_list, cra_list) {
+		if (q == alg)
+			continue;
+
+		if (crypto_is_moribund(q))
+			continue;
+
+		if (crypto_is_larval(q)) {
+			struct crypto_larval *larval = (void *)q;
+
+			/*
+			 * Check to see if either our generic name or
+			 * specific name can satisfy the name requested
+			 * by the larval entry q.
+			 */
+			if (strcmp(alg->cra_name, q->cra_name) &&
+			    strcmp(alg->cra_driver_name, q->cra_name))
+				continue;
+
+			if (larval->adult)
+				continue;
+			if ((q->cra_flags ^ alg->cra_flags) & larval->mask)
+				continue;
+
+			if (fulfill_requests && crypto_mod_get(alg))
+				larval->adult = alg;
+			else
+				larval->adult = ERR_PTR(-EAGAIN);
+
+			continue;
+		}
+
+		if (strcmp(alg->cra_name, q->cra_name))
+			continue;
+
+		if (strcmp(alg->cra_driver_name, q->cra_driver_name) &&
+		    q->cra_priority > alg->cra_priority)
+			continue;
+
+		crypto_remove_spawns(q, algs_to_put, alg);
+	}
+
+	crypto_notify(CRYPTO_MSG_ALG_LOADED, alg);
+}
+
+static struct crypto_larval *crypto_alloc_test_larval(struct crypto_alg *alg)
+{
+	struct crypto_larval *larval;
+
+	if (!IS_ENABLED(CONFIG_CRYPTO_MANAGER) ||
+	    IS_ENABLED(CONFIG_CRYPTO_MANAGER_DISABLE_TESTS) ||
+	    (alg->cra_flags & CRYPTO_ALG_INTERNAL))
+		return NULL; /* No self-test needed */
+
+	larval = crypto_larval_alloc(alg->cra_name,
+				     alg->cra_flags | CRYPTO_ALG_TESTED, 0);
+	if (IS_ERR(larval))
+		return larval;
+
+	larval->adult = crypto_mod_get(alg);
+	if (!larval->adult) {
+		kfree(larval);
+		return ERR_PTR(-ENOENT);
+	}
+
+	refcount_set(&larval->alg.cra_refcnt, 1);
+	memcpy(larval->alg.cra_driver_name, alg->cra_driver_name,
+	       CRYPTO_MAX_ALG_NAME);
+	larval->alg.cra_priority = alg->cra_priority;
+
+	return larval;
+}
+
+static struct crypto_larval *
+__crypto_register_alg(struct crypto_alg *alg, struct list_head *algs_to_put)
+{
+	struct crypto_alg *q;
+	struct crypto_larval *larval;
+	int ret = -EAGAIN;
+
+	if (crypto_is_dead(alg))
+		goto err;
+
+	INIT_LIST_HEAD(&alg->cra_users);
+
+	ret = -EEXIST;
+
+	list_for_each_entry(q, &crypto_alg_list, cra_list) {
+		if (q == alg)
+			goto err;
+
+		if (crypto_is_moribund(q))
+			continue;
+
+		if (crypto_is_larval(q)) {
+			if (!strcmp(alg->cra_driver_name, q->cra_driver_name))
+				goto err;
+			continue;
+		}
+
+		if (!strcmp(q->cra_driver_name, alg->cra_name) ||
+		    !strcmp(q->cra_name, alg->cra_driver_name))
+			goto err;
+	}
+
+	larval = crypto_alloc_test_larval(alg);
+	if (IS_ERR(larval))
+		goto out;
+
+	list_add(&alg->cra_list, &crypto_alg_list);
+
+	crypto_stats_init(alg);
+
+	if (larval) {
+		/* No cheating! */
+		alg->cra_flags &= ~CRYPTO_ALG_TESTED;
+
+		list_add(&larval->alg.cra_list, &crypto_alg_list);
+	} else {
+		alg->cra_flags |= CRYPTO_ALG_TESTED;
+		crypto_alg_finish_registration(alg, true, algs_to_put);
+	}
+
+out:
+	return larval;
+
+err:
+	larval = ERR_PTR(ret);
+	goto out;
+}
+
+void crypto_alg_tested(const char *name, int err)
+{
+	struct crypto_larval *test;
+	struct crypto_alg *alg;
+	struct crypto_alg *q;
+	LIST_HEAD(list);
+	bool best;
+
+	down_write(&crypto_alg_sem);
+	list_for_each_entry(q, &crypto_alg_list, cra_list) {
+		if (crypto_is_moribund(q) || !crypto_is_larval(q))
+			continue;
+
+		test = (struct crypto_larval *)q;
+
+		if (!strcmp(q->cra_driver_name, name))
+			goto found;
+	}
+
+	pr_err("alg: Unexpected test result for %s: %d\n", name, err);
+	goto unlock;
+
+found:
+	q->cra_flags |= CRYPTO_ALG_DEAD;
+	alg = test->adult;
+
+	if (list_empty(&alg->cra_list))
+		goto complete;
+
+	if (err == -ECANCELED)
+		alg->cra_flags |= CRYPTO_ALG_FIPS_INTERNAL;
+	else if (err)
+		goto complete;
+	else
+		alg->cra_flags &= ~CRYPTO_ALG_FIPS_INTERNAL;
+
+	alg->cra_flags |= CRYPTO_ALG_TESTED;
+
