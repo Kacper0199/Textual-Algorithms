@@ -7,3 +7,4 @@ Textual Algorithms course at AGH University of Science and Technology.
 - [lab3: Edit distance](https://github.com/Kacper0199/Textual-Algorithms/tree/main/lab3)
 - [lab4: Text clustering](https://github.com/Kacper0199/Textual-Algorithms/tree/main/lab4)
 - [lab5: Two dimensional pattern matching](https://github.com/Kacper0199/Textual-Algorithms/tree/main/lab5)
+- [lab6: Suffix trees](https://github.com/Kacper0199/Textual-Algorithms/tree/main/lab6)
